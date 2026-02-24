@@ -43,15 +43,19 @@ export interface AvailableGroup {
 }
 
 /**
- * Prepare the per-group session directory structure.
- * Returns the session HOME directory for claude.
+ * Prepare the per-group project-level config in the group folder.
+ *
+ * Claude Code discovers project settings from `.claude/settings.json` relative
+ * to its `cwd`. By placing config in `groups/{folder}/.claude/` we get
+ * per-group settings WITHOUT overriding CLAUDE_CONFIG_DIR or HOME — both of
+ * which break macOS Keychain auth needed for Max/Pro subscriptions.
  */
-function prepareSessionDir(group: RegisteredGroup): string {
-  const sessionHome = path.join(DATA_DIR, 'sessions', group.folder);
-  const claudeDir = path.join(sessionHome, '.claude');
+function prepareGroupConfig(group: RegisteredGroup): void {
+  const groupDir = resolveGroupFolderPath(group.folder);
+  const claudeDir = path.join(groupDir, '.claude');
   fs.mkdirSync(claudeDir, { recursive: true });
 
-  // Write settings.json if it doesn't exist
+  // Write project-level settings.json
   const settingsFile = path.join(claudeDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(settingsFile, JSON.stringify({
@@ -63,7 +67,7 @@ function prepareSessionDir(group: RegisteredGroup): string {
     }, null, 2) + '\n');
   }
 
-  // Sync skills from skills/ (project root) into session dir's .claude/skills/
+  // Sync skills from skills/ (project root) into group's .claude/skills/
   // Skip agent-browser (replaced by Playwright MCP later)
   const skillsSrc = path.join(process.cwd(), 'skills');
   const skillsDst = path.join(claudeDir, 'skills');
@@ -76,8 +80,6 @@ function prepareSessionDir(group: RegisteredGroup): string {
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
-
-  return sessionHome;
 }
 
 /**
@@ -192,14 +194,53 @@ function buildCliArgs(
 
 /**
  * Parse the JSON output from `claude -p --output-format json`.
- * Claude outputs JSON with `session_id` and `result` fields.
+ * Claude outputs a JSON array of events (streaming format).
+ * We look for the object with `type: "result"` which contains
+ * `session_id` and `result` fields.
  */
 function parseClaudeOutput(raw: string): { sessionId?: string; result?: string } {
   const trimmed = raw.trim();
   if (!trimmed) return {};
 
-  // Try parsing the last JSON line (claude may output other lines before)
+  // Claude --output-format json produces a JSON array: [{init},{assistant},...,{result}]
+  // or newline-delimited JSON objects.
+  // Strategy: try parsing as array first, then individual lines.
+
+  // Try as JSON array
+  if (trimmed.startsWith('[')) {
+    try {
+      const arr = JSON.parse(trimmed) as Array<Record<string, unknown>>;
+      const resultObj = arr.find((obj) => obj.type === 'result');
+      if (resultObj) {
+        return {
+          sessionId: resultObj.session_id as string | undefined,
+          result: resultObj.result as string | undefined,
+        };
+      }
+    } catch {
+      // fall through to line-by-line parsing
+    }
+  }
+
+  // Try line-by-line (newline-delimited JSON)
   const lines = trimmed.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line.startsWith('{')) continue;
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed.type === 'result') {
+        return {
+          sessionId: parsed.session_id,
+          result: parsed.result,
+        };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // Fallback: try last JSON object regardless of type
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
     if (!line.startsWith('{')) continue;
@@ -214,16 +255,7 @@ function parseClaudeOutput(raw: string): { sessionId?: string; result?: string }
     }
   }
 
-  // Try the whole output
-  try {
-    const parsed = JSON.parse(trimmed);
-    return {
-      sessionId: parsed.session_id,
-      result: parsed.result,
-    };
-  } catch {
-    return {};
-  }
+  return {};
 }
 
 export async function runCliAgent(
@@ -237,7 +269,7 @@ export async function runCliAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const sessionHome = prepareSessionDir(group);
+  prepareGroupConfig(group);
   const groupIpcDir = prepareIpcDir(input.groupFolder);
   const mcpConfigPath = writeMcpConfig(groupIpcDir, input.chatJid, input.groupFolder, input.isMain);
 
@@ -258,7 +290,6 @@ export async function runCliAgent(
       group: group.name,
       cliArgs: cliArgs.join(' '),
       cwd: groupDir,
-      sessionHome,
     },
     'CLI agent configuration',
   );
@@ -272,8 +303,10 @@ export async function runCliAgent(
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,
-        HOME: sessionHome,
         TZ: TIMEZONE,
+        // Remove CLAUDECODE to avoid "nested session" error when NanoClaw
+        // itself runs inside a Claude Code session (e.g. via `tsx`)
+        CLAUDECODE: undefined,
       },
     });
 
